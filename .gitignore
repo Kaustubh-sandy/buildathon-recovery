@@ -1,0 +1,125 @@
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.local
+.env.*.local
+.env.development
+.env.test
+.env.production
+!.env.example
+!.env.template
+*.pem
+*.key
+*.crt
+secrets.json
+credentials.json
+
+# ==========================================
+# Python Backend
+# ==========================================
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing & Linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# Python packaging & distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ML Model artifacts & checkpoints
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+*.onnx
+
+# ==========================================
+# Node.js & Frontend (Next.js / React)
+# ==========================================
+# Dependencies
+node_modules/
+**/node_modules/
+.pnp
+.pnp.js
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# Next.js & Build outputs
+.next/
+**/.next/
+out/
+**/out/
+*.tsbuildinfo
+next-env.d.ts
+.vercel/
+.turbo/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+logs/
+
+# ==========================================
+# Databases & Temp Files
+# ==========================================
+*.sqlite
+*.sqlite3
+*.db
+tmp/
+temp/
+scratch/
+
+# ==========================================
+# Operating System & Editor Files
+# ==========================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSSharedFileList
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Editors & IDEs
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
