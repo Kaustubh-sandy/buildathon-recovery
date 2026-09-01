@@ -177,6 +177,34 @@ class BatchRunRequest(BaseModel):
     sample_size: Optional[int] = Field(default=1000, ge=10, le=20000)
 
 
+class CreateOrderRequest(BaseModel):
+    amount_inr: float
+    receipt: str = "receipt_default"
+    currency: str = "INR"
+    case_id: Optional[str] = None
+
+    @field_validator('amount_inr')
+    @classmethod
+    def amount_min_one_rupee(cls, v):
+        if v < 1.0:
+            raise ValueError('amount_inr must be >= 1.00 (minimum 100 paise)')
+        return v
+
+
+class VerifyPaymentRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+    case_id: Optional[str] = None
+
+    @field_validator('razorpay_order_id', 'razorpay_payment_id', 'razorpay_signature')
+    @classmethod
+    def must_not_be_empty(cls, v):
+        if not v.strip():
+            raise ValueError('field must not be empty')
+        return v
+
+
 # ─────────────────────────────────────────────────────────────
 # Audit helper
 # ─────────────────────────────────────────────────────────────
@@ -528,6 +556,79 @@ def model_info():
         "training_metrics":  model.training_metrics,
         "feature_count":     len(model.feature_names),
         "features":          model.feature_names,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# Razorpay Standard Checkout endpoints
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/api/create-order")
+def create_razorpay_order(req: CreateOrderRequest):
+    """
+    Creates a Razorpay Order for Standard Checkout.
+    Returns order_id + amount (paise) + currency to the frontend.
+    KEY_SECRET never leaves this backend.
+    """
+    try:
+        result = razorpay_client.create_order(
+            amount_inr = req.amount_inr,
+            receipt    = req.receipt,
+            currency   = req.currency,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Razorpay order creation failed: {e}")
+
+    # Attach the public KEY_ID so frontend can open the modal without needing it in .env
+    result["key_id"] = razorpay_client.key_id
+
+    if req.case_id:
+        log_audit_event(req.case_id, "RAZORPAY_ORDER_CREATED", {
+            "order_id":   result.get("order_id"),
+            "amount_inr": req.amount_inr,
+            "is_mock":    result.get("is_mock"),
+        })
+
+    return result
+
+
+@app.post("/api/verify-payment")
+def verify_razorpay_payment(req: VerifyPaymentRequest):
+    """
+    Verifies Razorpay payment signature.
+    Algorithm: HMAC-SHA256(order_id + "|" + payment_id, KEY_SECRET)
+    Returns HTTP 200 + verified=true ONLY when signatures match.
+    Returns HTTP 400 on mismatch — do NOT mark payment as captured on any other response.
+    """
+    result = razorpay_client.verify_payment_signature(
+        razorpay_order_id   = req.razorpay_order_id,
+        razorpay_payment_id = req.razorpay_payment_id,
+        razorpay_signature  = req.razorpay_signature,
+    )
+
+    if not result.get("verified"):
+        # Signature mismatch — never mark as paid
+        log_audit_event(req.case_id or "unknown", "PAYMENT_SIGNATURE_FAILED", result)
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("error", "Signature verification failed"),
+        )
+
+    log_audit_event(req.case_id or req.razorpay_order_id, "PAYMENT_VERIFIED", {
+        "razorpay_order_id":   req.razorpay_order_id,
+        "razorpay_payment_id": req.razorpay_payment_id,
+        "is_mock":             result.get("is_mock"),
+    })
+
+    return {
+        "status":              "PAYMENT_VERIFIED",
+        "verified":            True,
+        "razorpay_order_id":   req.razorpay_order_id,
+        "razorpay_payment_id": req.razorpay_payment_id,
+        "message":             result.get("message", "Payment verified"),
+        "mode":                result.get("mode"),
     }
 
 

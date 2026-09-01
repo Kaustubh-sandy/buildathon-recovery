@@ -520,10 +520,172 @@ function DashboardSection() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Razorpay Standard Checkout
+// ─────────────────────────────────────────────────────────────
+declare global {
+  interface Window {
+    Razorpay: new (options: Record<string, unknown>) => { open(): void };
+  }
+}
+
+function RazorpayCheckoutSection() {
+  const [caseId, setCaseId]   = useState("610");
+  const [amount, setAmount]   = useState("499");
+  const [status, setStatus]   = useState<"idle"|"ordering"|"verifying"|"success"|"failed"|"cancelled">("idle");
+  const [result, setResult]   = useState<Record<string, unknown> | null>(null);
+  const [error,  setError]    = useState<string | null>(null);
+
+  const openCheckout = async () => {
+    setError(null);
+    setResult(null);
+    setStatus("ordering");
+
+    // Step 1: Create order on backend (KEY_SECRET stays server-side)
+    let order: Record<string, unknown>;
+    try {
+      order = await api("POST", "/api/create-order", {
+        amount_inr: Number(amount),
+        receipt:    `receipt_${caseId}_${Date.now()}`,
+        case_id:    caseId,
+      });
+    } catch (e) {
+      setError(`Order creation failed: ${e}`);
+      setStatus("failed");
+      return;
+    }
+
+    if (!order.order_id) {
+      setError(`Backend error: ${JSON.stringify(order)}`);
+      setStatus("failed");
+      return;
+    }
+
+    setStatus("idle"); // modal will take over
+
+    // Step 2: Open Razorpay modal
+    // key_id is returned by the backend alongside the order — KEY_SECRET never touches frontend
+    const options = {
+      key:         order.key_id as string,
+      amount:      order.amount as number,       // paise
+      currency:    order.currency as string,
+      name:        "RecoverAI",
+      description: `Recovery payment — Case #${caseId}`,
+      order_id:    order.order_id as string,
+      theme:       { color: "#2563EB" },
+      modal: {
+        ondismiss: () => {
+          setStatus("cancelled");
+          setError("Payment cancelled by user.");
+        },
+      },
+      handler: async (response: Record<string, string>) => {
+        // Step 3: Verify signature on backend
+        setStatus("verifying");
+        try {
+          const verification = await api("POST", "/api/verify-payment", {
+            razorpay_order_id:   response.razorpay_order_id,
+            razorpay_payment_id: response.razorpay_payment_id,
+            razorpay_signature:  response.razorpay_signature,
+            case_id: caseId,
+          });
+          if (verification.verified) {
+            setStatus("success");
+            setResult(verification);
+          } else {
+            setStatus("failed");
+            setError("Signature mismatch — payment not verified.");
+            setResult(verification);
+          }
+        } catch (e) {
+          setStatus("failed");
+          setError(`Verification request failed: ${e}`);
+        }
+      },
+      prefill: {
+        name:    "Test Customer",
+        email:   "success@razorpay.com",
+        contact: "9999999999",
+      },
+    };
+
+    const rzp = new window.Razorpay(options);
+    rzp.open();
+  };
+
+  const statusConfig: Record<string, { label: string; color: "green"|"red"|"amber"|"zinc" }> = {
+    idle:       { label: "Ready",       color: "zinc"  },
+    ordering:   { label: "Creating order…",  color: "amber" },
+    verifying:  { label: "Verifying signature…", color: "amber" },
+    success:    { label: "Payment Verified ✓", color: "green" },
+    failed:     { label: "Failed ✗",    color: "red"   },
+    cancelled:  { label: "Cancelled",   color: "zinc"  },
+  };
+  const sc = statusConfig[status];
+
+  return (
+    <Card title="10 · Razorpay Standard Checkout  POST /api/create-order">
+
+      {/* Test card notice */}
+      <div className="bg-blue-950 border border-blue-700 rounded-lg p-3 text-xs text-blue-300">
+        <p className="font-semibold mb-1">Test Cards (use in the modal)</p>
+        <div className="grid grid-cols-2 gap-1 font-mono">
+          <span>Success:</span>     <span>4111 1111 1111 1111</span>
+          <span>Failure:</span>     <span>4000 0000 0000 0002</span>
+          <span>Expiry:</span>      <span>Any future date</span>
+          <span>CVV:</span>         <span>Any 3 digits</span>
+        </div>
+        <p className="mt-1 text-blue-400">Or use UPI: <code>success@razorpay</code></p>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Input label="Case ID" value={caseId} onChange={setCaseId} />
+        <Input label="Amount (INR)" value={amount} onChange={setAmount} type="number" />
+      </div>
+
+      <div className="flex items-center gap-3">
+        <Btn
+          onClick={openCheckout}
+          loading={status === "ordering" || status === "verifying"}
+          color="green"
+        >
+          Pay ₹{amount} via Razorpay
+        </Btn>
+        <Badge label={sc.label} color={sc.color} />
+      </div>
+
+      {error && (
+        <div className="bg-red-950 border border-red-700 rounded-lg p-3 text-xs text-red-300">
+          {error}
+        </div>
+      )}
+
+      {status === "success" && result && (
+        <div className="bg-emerald-950 border border-emerald-700 rounded-lg p-3">
+          <p className="text-emerald-300 font-semibold text-sm mb-2">Payment verified successfully</p>
+          <Pre data={result} />
+        </div>
+      )}
+
+      {/* Flow diagram */}
+      <div className="bg-zinc-800/50 rounded-lg p-3 text-xs text-zinc-400 font-mono leading-5">
+        <p className="text-zinc-300 font-semibold mb-1">Execution flow (test mode):</p>
+        <p>1. Frontend → POST /api/create-order (backend calls Razorpay API)</p>
+        <p>2. Backend  → Returns order_id + key_id (KEY_SECRET never sent to browser)</p>
+        <p>3. Frontend → Opens Razorpay modal with order_id</p>
+        <p>4. Customer → Completes payment in modal</p>
+        <p>5. Frontend → Receives payment_id + signature from Razorpay</p>
+        <p>6. Frontend → POST /api/verify-payment (backend verifies HMAC-SHA256)</p>
+        <p>7. Backend  → Returns verified=true only if signature matches</p>
+      </div>
+    </Card>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 // ROOT PAGE
 // ─────────────────────────────────────────────────────────────
 export default function Home() {
-  const TABS = ["Health","Analyze","Execute","Batch","Dunning","PTP","Audit","Cases","Dashboard"] as const;
+  const TABS = ["Health","Analyze","Execute","Batch","Dunning","PTP","Audit","Cases","Dashboard","Razorpay"] as const;
   const [tab, setTab] = useState<typeof TABS[number]>("Health");
 
   return (
@@ -562,6 +724,7 @@ export default function Home() {
         {tab === "Audit"     && <AuditSection />}
         {tab === "Cases"     && <CasesSection />}
         {tab === "Dashboard" && <DashboardSection />}
+        {tab === "Razorpay"  && <RazorpayCheckoutSection />}
       </div>
     </div>
   );
