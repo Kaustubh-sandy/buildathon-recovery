@@ -14,6 +14,10 @@ import datetime
 from enum import Enum
 from typing import Dict, Any, Optional, List
 from pydantic import BaseModel
+from dotenv import load_dotenv
+
+load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'))
 
 # ─────────────────────────────────────────────────────────────
 # Recovery State Machine
@@ -87,11 +91,19 @@ class RecoveryAgent:
         try:
             import google.generativeai as genai
             genai.configure(api_key=self.llm_api_key)
-            self._gemini_model = genai.GenerativeModel("gemini-2.0-flash")
-            print("[Agent] Gemini model initialised.")
+            for model_name in ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-flash-latest"]:
+                try:
+                    self._gemini_model = genai.GenerativeModel(model_name)
+                    print(f"[Agent] Gemini model initialised with {model_name}.")
+                    break
+                except Exception:
+                    continue
+
         except Exception as e:
             print(f"[Agent] Gemini initialisation failed — using fallback parser: {e}")
             self._gemini_model = None
+
+
 
     # ─────────────────────────────────────────────────────────
     # Case Diagnosis

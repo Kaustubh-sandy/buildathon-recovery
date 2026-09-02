@@ -307,17 +307,34 @@ class RecoveryPolicyModel:
 
     def load_model(self) -> bool:
         """Loads model + metadata from policy_model.pkl. Returns True on success."""
-        if not os.path.exists(self.model_path):
+        candidates = [
+            self.model_path,
+            'models/policy_model.pkl',
+            'backend/models/policy_model.pkl',
+            'backend/backend/models/policy_model.pkl',
+            os.path.join(os.path.dirname(__file__), '..', 'models', 'policy_model.pkl'),
+            os.path.join(os.path.dirname(__file__), '..', '..', 'models', 'policy_model.pkl'),
+            os.path.join(os.path.dirname(__file__), '..', '..', 'backend', 'models', 'policy_model.pkl'),
+        ]
+        resolved_path = None
+        for p in candidates:
+            if p and os.path.exists(p):
+                resolved_path = p
+                break
+
+        if not resolved_path:
             return False
+
         try:
             if HAS_JOBLIB:
-                artifact = joblib.load(self.model_path)
+                artifact = joblib.load(resolved_path)
             else:
-                with open(self.model_path, 'rb') as f:
+                with open(resolved_path, 'rb') as f:
                     artifact = pickle.load(f)
 
             self.model                       = artifact['model']
             self.feature_names               = artifact['feature_names']
+
             self.categorical_feature_indices = artifact.get('categorical_feature_indices', [])
             self.cat_vocab                   = artifact.get('cat_vocab', {})
             self.is_trained                  = artifact.get('is_trained', True)

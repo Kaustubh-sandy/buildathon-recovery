@@ -8,7 +8,8 @@ import uuid
 import datetime
 from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+import io
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 import pandas as pd
@@ -54,6 +55,7 @@ app.add_middleware(
 # ─────────────────────────────────────────────────────────────
 
 model           = RecoveryPolicyModel()
+model.load_model()
 guardrails      = GuardrailEngine()
 agent           = RecoveryAgent()
 razorpay_client = RazorpayTestClient()
@@ -204,6 +206,28 @@ class VerifyPaymentRequest(BaseModel):
             raise ValueError('field must not be empty')
         return v
 
+
+class DiagnoseAndActRequest(BaseModel):
+    """Payload sent by the frontend when a payment fails or is dismissed."""
+    case_id: str
+    amount_inr: float
+    failure_reason: str            = "PAYMENT_FAILED"
+    customer_id: Optional[str]     = None
+    channel: str                   = "WHATSAPP"
+    locale: str                    = "HI_EN"
+    timestamp: Optional[str]       = None
+    # Optional override fields (used when case is not in test_batch.csv)
+    failure_class_at_decision: Optional[str] = None
+    retries_used_before: Optional[int]       = None
+    rail: Optional[str]                      = None
+    bank_name: Optional[str]                 = None
+
+    @field_validator('amount_inr')
+    @classmethod
+    def amount_positive(cls, v):
+        if v <= 0:
+            raise ValueError('amount_inr must be > 0')
+        return v
 
 # ─────────────────────────────────────────────────────────────
 # Audit helper
@@ -368,9 +392,10 @@ def execute_recovery(req: CaseExecutionRequest):
             amount_inr      = req.amount_inr,
             customer_name   = req.customer_name   or "Customer",
             customer_email  = req.customer_email  or "customer@example.com",
-            customer_phone  = req.customer_phone  or "9999999999",
+            customer_phone  = req.customer_phone  or "9876543210",
             description     = f"RecoverAI Recovery — Case #{req.case_id}",
         )
+
     elif exec_action == "RETRY":
         execution_result = razorpay_client.retry_subscription_charge(
             f"sub_{req.case_id}"
@@ -416,9 +441,120 @@ def run_batch(req: BatchRunRequest):
         runner = BatchRunner(data_path=data_file)
         results = runner.run_simulation(sample_size=req.sample_size)
         LATEST_BATCH_RESULTS = results
+
+        # Persist batch audit trail to central audit registry
+        if results.case_details:
+            for c in results.case_details:
+                cid = str(c.get('transaction_id', ''))
+                if cid:
+                    log_audit_event(cid, "BATCH_EVALUATION_COMPLETED", {
+                        "batch_id": results.batch_id,
+                        "amount_inr": c.get('amount_inr'),
+                        "p_recovery": c.get('p_recovery'),
+                        "erv": c.get('erv'),
+                        "risk_level": c.get('risk_level'),
+                        "recommended_action": c.get('recommended_action'),
+                        "guardrail_status": c.get('guardrail_status'),
+                        "reasoning": c.get('agent_reasoning'),
+                        "audit_steps": c.get('audit_steps'),
+                    })
+        if results.batch_audit_log:
+            log_audit_event(results.batch_id, "BATCH_ORCHESTRATION_COMPLETED", {
+                "batch_id": results.batch_id,
+                "cases_evaluated": results.cases_evaluated,
+                "revenue_at_risk_inr": results.revenue_at_risk_inr,
+                "incremental_revenue_inr": results.incremental_revenue_inr,
+                "recovery_uplift_pct": results.recovery_uplift_pct,
+                "batch_log": results.batch_audit_log,
+            })
+
         return results.model_dump()
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/api/batch/upload")
+async def upload_batch_csv(file: UploadFile = File(...)):
+    """
+    Accepts a user-uploaded CSV file containing transactions with columns:
+      - transaction_id
+      - customer_id
+      - amount_inr
+      - status
+      - failure_code
+      - payment_method
+      - attempt_count
+      - timestamp
+    Normalizes the data, runs the full RecoverAI vs Baseline evaluation,
+    and returns BatchResults with per-transaction recovery recommendations.
+    """
+    global LATEST_BATCH_RESULTS
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Uploaded CSV file is empty.")
+
+        runner = BatchRunner()
+        results = runner.run_simulation(df=df)
+        LATEST_BATCH_RESULTS = results
+
+        # Persist custom batch audit trail to central audit registry
+        if results.case_details:
+            for c in results.case_details:
+                cid = str(c.get('transaction_id', ''))
+                if cid:
+                    log_audit_event(cid, "BATCH_EVALUATION_COMPLETED", {
+                        "batch_id": results.batch_id,
+                        "amount_inr": c.get('amount_inr'),
+                        "p_recovery": c.get('p_recovery'),
+                        "erv": c.get('erv'),
+                        "risk_level": c.get('risk_level'),
+                        "recommended_action": c.get('recommended_action'),
+                        "guardrail_status": c.get('guardrail_status'),
+                        "reasoning": c.get('agent_reasoning'),
+                        "audit_steps": c.get('audit_steps'),
+                    })
+        if results.batch_audit_log:
+            log_audit_event(results.batch_id, "BATCH_ORCHESTRATION_COMPLETED", {
+                "batch_id": results.batch_id,
+                "cases_evaluated": results.cases_evaluated,
+                "revenue_at_risk_inr": results.revenue_at_risk_inr,
+                "incremental_revenue_inr": results.incremental_revenue_inr,
+                "recovery_uplift_pct": results.recovery_uplift_pct,
+                "batch_log": results.batch_audit_log,
+            })
+
+        return results.model_dump()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to process CSV file: {str(e)}")
+
+
+
+@app.get("/api/batch/sample-template")
+def download_sample_template():
+    """
+    Returns a downloadable sample CSV with the required columns:
+      transaction_id,customer_id,amount_inr,status,failure_code,payment_method,attempt_count,timestamp
+    """
+    csv_data = (
+        "transaction_id,customer_id,amount_inr,status,failure_code,payment_method,attempt_count,timestamp\n"
+        "TXN_901,CUST_4011,499.0,FAILED,INSUFFICIENT_FUNDS,UPI_AUTOPAY,0,2026-08-28T14:30:00\n"
+        "TXN_902,CUST_4012,8500.0,FAILED,RATE_LIMIT,CARD,2,2026-08-28T16:45:00\n"
+        "TXN_903,CUST_4013,1200.0,FAILED,MANDATE_CLOSED,UPI_AUTOPAY,1,2026-08-28T18:00:00\n"
+        "TXN_904,CUST_4014,350.0,FAILED,CARD_EXPIRED,CARD,0,2026-08-28T19:15:00\n"
+        "TXN_905,CUST_4015,15000.0,FAILED,BANK_TECHNICAL,NETBANKING,1,2026-08-28T21:00:00\n"
+        "TXN_906,CUST_4016,299.0,RECOVERED,INSUFFICIENT_FUNDS,UPI_AUTOPAY,1,2026-08-29T10:00:00\n"
+        "TXN_907,CUST_4017,2499.0,FAILED,INSUFFICIENT_FUNDS,UPI_AUTOPAY,0,2026-08-29T11:30:00\n"
+        "TXN_908,CUST_4018,499.0,FAILED,GATEWAY_TIMEOUT,CARD,1,2026-08-29T15:00:00\n"
+    )
+    return Response(
+        content=csv_data,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=recoverai_sample_batch.csv"},
+    )
 
 
 @app.get("/api/batch/results")
@@ -432,6 +568,7 @@ def get_batch_results(batch_id: Optional[str] = None):
         status_code=404,
         detail="No batch results available. Run POST /api/batch/run first."
     )
+
 
 
 @app.get("/api/audit/{case_id}")
@@ -629,6 +766,225 @@ def verify_razorpay_payment(req: VerifyPaymentRequest):
         "razorpay_payment_id": req.razorpay_payment_id,
         "message":             result.get("message", "Payment verified"),
         "mode":                result.get("mode"),
+    }
+
+
+
+# ─────────────────────────────────────────────────────────────
+# AI Recovery Loop — diagnose-and-act (triggered on payment failure)
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/api/recovery/diagnose-and-act")
+def diagnose_and_act(req: DiagnoseAndActRequest):
+    """
+    The central AI Recovery Loop endpoint.
+    Called immediately when a payment fails or is dismissed.
+
+    Pipeline (in order):
+      1. Case lookup   — find context from test_batch.csv by case_id
+      2. ML prediction — P(recovery | case features)
+      3. Guardrails    — check limits, fraud, opt-out, cooldown
+      4. Payment link  — create Razorpay payment link for recovery
+      5. LLM copy      — generate localized dunning message (Gemini / template)
+      6. Audit log     — write timeline event
+      7. Return        — full recovery plan for UI rendering
+    """
+    import datetime as _dt
+    import os as _os
+
+    audit_steps: List[Dict[str, Any]] = []
+    t0 = _dt.datetime.utcnow()
+
+    def step(name: str, detail: Dict[str, Any]):
+        audit_steps.append({
+            "step":      name,
+            "timestamp": _dt.datetime.utcnow().isoformat(),
+            "detail":    detail,
+        })
+
+    # ── 1. Case Lookup ───────────────────────────────────────────────
+    case_dict: Dict[str, Any] = {
+        "case_id":                  req.case_id,
+        "amount_inr":               req.amount_inr,
+        "failure_class_at_decision": req.failure_class_at_decision or "BANK_TECHNICAL",
+        "retries_used_before":      req.retries_used_before if req.retries_used_before is not None else 0,
+        "rail":                     req.rail or "UPI_AUTOPAY",
+        "bank_name":                req.bank_name or "UNKNOWN",
+        "contacts_sent_before":     0,
+        "prior_success_rate":       0.60,
+        "customer_tenure_days":     365,
+        "hours_since_open":         0,
+    }
+
+    # Try to find richer context from test_batch.csv
+    data_file = "data/test_batch.csv" if _os.path.exists("data/test_batch.csv") else "backend/data/test_batch.csv"
+    case_source = "request_payload"
+    if _os.path.exists(data_file):
+        try:
+            df_lookup = pd.read_csv(data_file)
+            matches   = df_lookup[df_lookup["case_id"].astype(str) == str(req.case_id)]
+            if not matches.empty:
+                case_dict   = matches.iloc[0].to_dict()
+                # Override amount and failure reason from live request
+                case_dict["amount_inr"] = req.amount_inr
+                case_source = "test_batch_csv"
+        except Exception:
+            pass
+
+    step("CASE_LOOKUP", {
+        "case_id":   req.case_id,
+        "source":    case_source,
+        "amount_inr": req.amount_inr,
+        "failure_reason": req.failure_reason,
+        "failure_class":  case_dict.get("failure_class_at_decision"),
+        "bank_name":      case_dict.get("bank_name"),
+        "retries_used":   case_dict.get("retries_used_before"),
+    })
+
+    # ── 2. ML Prediction ───────────────────────────────────────────
+    p_rec = 0.50  # fallback
+    if model.is_trained:
+        try:
+            p_rec = model.predict_proba(case_dict)
+        except Exception as e:
+            step("ML_PREDICTION_ERROR", {"error": str(e)})
+
+    risk_level = "LOW" if p_rec >= 0.65 else "MEDIUM" if p_rec >= 0.35 else "HIGH"
+    erv        = round(p_rec * req.amount_inr, 2)
+
+    step("ML_PREDICTION", {
+        "recovery_probability": p_rec,
+        "risk_level":           risk_level,
+        "expected_recovery_inr": erv,
+    })
+
+    # ── 3. Action Policy ───────────────────────────────────────────
+    try:
+        action_rankings = model.evaluate_actions(case_dict)
+        proposed_action = action_rankings[0]["action"] if action_rankings else "SEND_PAYMENT_LINK"
+    except Exception:
+        action_rankings = []
+        proposed_action = "SEND_PAYMENT_LINK"
+
+    step("ACTION_POLICY", {"proposed_action": proposed_action, "rankings": action_rankings[:3]})
+
+    # ── 4. Guardrails ──────────────────────────────────────────────
+    g_eval       = guardrails.evaluate(case_dict, proposed_action)
+    final_action = g_eval.recommended_action
+
+    step("GUARDRAILS", {
+        "status":          g_eval.status,
+        "proposed_action": proposed_action,
+        "final_action":    final_action,
+        "violations": [v.model_dump() for v in g_eval.policy_violations],
+        "checks_passed": len(g_eval.policy_violations) == 0,
+    })
+
+    # ── 5. Razorpay Payment Link ──────────────────────────────────
+    payment_link_result = {}
+    payment_url         = ""
+    link_cost_inr       = 0.0
+
+    if g_eval.status != "BLOCKED":
+        try:
+            payment_link_result = razorpay_client.create_payment_link(
+                amount_inr      = req.amount_inr,
+                customer_name   = req.customer_id or "Valued Customer",
+                description     = f"RecoverAI Recovery — Case #{req.case_id}",
+            )
+            payment_url   = payment_link_result.get("short_url", "")
+            link_cost_inr = 0.50 if not payment_link_result.get("is_mock") else 0.0
+        except Exception as e:
+            step("PAYMENT_LINK_ERROR", {"error": str(e)})
+
+    step("PAYMENT_LINK", {
+        "payment_url": payment_url,
+        "is_mock":     payment_link_result.get("is_mock", True),
+        "cost_inr":    link_cost_inr,
+    })
+
+    # ── 6. LLM Dunning Message ──────────────────────────────────
+    dunning_case = dict(case_dict)
+    dunning_case["amount_inr"] = req.amount_inr
+
+    dunning_result = agent.generate_dunning_message(
+        case    = dunning_case,
+        channel = req.channel,
+        locale  = req.locale,
+    )
+    # Inject the real payment link into the message if we got one
+    if payment_url and payment_url not in dunning_result.get("message_body", ""):
+        dunning_result["message_body"] = (
+            dunning_result.get("message_body", "") + f"\n\nLink: {payment_url}"
+        )
+    dunning_result["payment_link"] = payment_url
+
+    step("DUNNING_GENERATED", {
+        "channel":      req.channel,
+        "locale":       req.locale,
+        "method":       dunning_result.get("method"),
+        "message_preview": dunning_result.get("message_body", "")[:80] + "...",
+    })
+
+    # ── 7. Audit + Cost Accounting ──────────────────────────────
+    elapsed_ms = int((_dt.datetime.utcnow() - t0).total_seconds() * 1000)
+
+    log_audit_event(req.case_id, "RECOVERY_TRIGGERED", {
+        "failure_reason":        req.failure_reason,
+        "recovery_probability":  p_rec,
+        "risk_level":            risk_level,
+        "final_action":          final_action,
+        "guardrail_status":      g_eval.status,
+        "payment_url":           payment_url,
+        "expected_recovery_inr": erv,
+        "cost_inr":              link_cost_inr,
+        "elapsed_ms":            elapsed_ms,
+    })
+
+    # ── 8. Return full recovery plan ────────────────────────────
+    return {
+        # Trigger context
+        "case_id":         req.case_id,
+        "amount_inr":      req.amount_inr,
+        "failure_reason":  req.failure_reason,
+        "case_source":     case_source,
+
+        # Diagnosis
+        "diagnosis": {
+            "failure_class":         case_dict.get("failure_class_at_decision"),
+            "bank_name":             case_dict.get("bank_name"),
+            "rail":                  case_dict.get("rail"),
+            "risk_level":            risk_level,
+            "recovery_probability":  p_rec,
+            "expected_recovery_inr": erv,
+            "retries_used":          case_dict.get("retries_used_before", 0),
+            "customer_tenure_days":  case_dict.get("customer_tenure_days"),
+            "prior_success_rate":    case_dict.get("prior_success_rate"),
+        },
+
+        # Policy decision
+        "policy": {
+            "proposed_action":  proposed_action,
+            "final_action":     final_action,
+            "guardrail_status": g_eval.status,
+            "guardrail_reason": g_eval.reason,
+            "violations":       [v.model_dump() for v in g_eval.policy_violations],
+        },
+
+        # Recovery action
+        "recovery_action": {
+            "action":       final_action,
+            "payment_url":  payment_url,
+            "payment_link": payment_link_result,
+            "cost_inr":     link_cost_inr,
+        },
+
+        # Outreach
+        "outreach": dunning_result,
+
+        # Audit trail
+        "audit_steps":  audit_steps,
+        "elapsed_ms":   elapsed_ms,
     }
 
 

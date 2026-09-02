@@ -205,9 +205,10 @@ class RazorpayTestClient:
         amount_inr: float,
         customer_name:  str = "Valued Customer",
         customer_email: str = "customer@example.com",
-        customer_phone: str = "9999999999",
+        customer_phone: str = "9876543210",
         description:    str = "RecoverAI Revenue Recovery Link",
     ) -> Dict[str, Any]:
+
         """Creates a Razorpay Payment Link (for dunning/recovery flows)."""
         amount_paise = int(round(amount_inr * 100))
 
