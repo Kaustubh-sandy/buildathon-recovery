@@ -11,3 +11,4 @@ razorpay>=1.4.0
 python-dotenv>=1.0.0
 google-generativeai>=0.8.0
 python-multipart>=0.0.9
+twilio>=9.0.0

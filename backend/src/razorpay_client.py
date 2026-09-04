@@ -207,10 +207,15 @@ class RazorpayTestClient:
         customer_email: str = "customer@example.com",
         customer_phone: str = "9876543210",
         description:    str = "RecoverAI Revenue Recovery Link",
+        case_id:        Optional[str] = None,
+        notes:          Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
 
         """Creates a Razorpay Payment Link (for dunning/recovery flows)."""
         amount_paise = int(round(amount_inr * 100))
+        notes_dict = dict(notes or {})
+        if case_id:
+            notes_dict["case_id"] = str(case_id)
 
         if not self.is_mock and self.client:
             try:
@@ -226,6 +231,7 @@ class RazorpayTestClient:
                     },
                     "notify":          {"sms": True, "email": True},
                     "reminder_enable": True,
+                    "notes":           notes_dict,
                 }
                 res = self.client.payment_link.create(payload)
                 return {
@@ -235,6 +241,7 @@ class RazorpayTestClient:
                     "amount_inr":      amount_inr,
                     "is_mock":         False,
                     "mode":            "Razorpay Test Mode",
+                    "case_id":         case_id,
                 }
             except Exception as e:
                 print(f"[Razorpay] create_payment_link error — mock fallback: {e}")
@@ -249,6 +256,7 @@ class RazorpayTestClient:
             "is_mock":         True,
             "mode":            "Recovery Simulator",
             "created_at":      datetime.datetime.utcnow().isoformat(),
+            "case_id":         case_id,
         }
 
     # ─────────────────────────────────────────────────────────

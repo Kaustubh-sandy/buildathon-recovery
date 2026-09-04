@@ -24,6 +24,7 @@ from src.guardrails import GuardrailEngine, GuardrailEvaluation, record_executio
 from src.agent import RecoveryAgent, AgentDiagnosis, PTPParseResult, RecoveryState
 from src.razorpay_client import RazorpayTestClient
 from src.batch_runner import BatchRunner, BatchResults
+from src.sms_service import send_recovery_sms, send_recovery_link_sms, format_phone_e164
 
 # ─────────────────────────────────────────────────────────────
 # App setup
@@ -63,6 +64,7 @@ razorpay_client = RazorpayTestClient()
 # In-memory audit trail (session-scoped; replace with DB for production)
 AUDIT_LOGS: Dict[str, List[Dict[str, Any]]] = {}
 LATEST_BATCH_RESULTS: Optional[BatchResults] = None
+CASE_LEDGER: Dict[str, Dict[str, Any]] = {}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -221,6 +223,7 @@ class DiagnoseAndActRequest(BaseModel):
     retries_used_before: Optional[int]       = None
     rail: Optional[str]                      = None
     bank_name: Optional[str]                 = None
+    customer_phone: Optional[str]            = "+919234633668"
 
     @field_validator('amount_inr')
     @classmethod
@@ -891,11 +894,34 @@ def diagnose_and_act(req: DiagnoseAndActRequest):
                 amount_inr      = req.amount_inr,
                 customer_name   = req.customer_id or "Valued Customer",
                 description     = f"RecoverAI Recovery — Case #{req.case_id}",
+                case_id         = str(req.case_id),
             )
             payment_url   = payment_link_result.get("short_url", "")
             link_cost_inr = 0.50 if not payment_link_result.get("is_mock") else 0.0
         except Exception as e:
             step("PAYMENT_LINK_ERROR", {"error": str(e)})
+
+    # Live State Ledger registration
+    cid = str(req.case_id)
+    initial_status = "PENDING_PAYMENT" if payment_url else ("BLOCKED" if g_eval.status == "BLOCKED" else "IN_RECOVERY")
+    CASE_LEDGER[cid] = {
+        "case_id":         cid,
+        "status":          initial_status,
+        "amount_inr":      req.amount_inr,
+        "payment_link_id": payment_link_result.get("payment_link_id"),
+        "short_url":       payment_url,
+        "failure_reason":  req.failure_reason,
+        "customer_id":     req.customer_id or "Valued Customer",
+        "created_at":      _dt.datetime.utcnow().isoformat(),
+        "updated_at":      _dt.datetime.utcnow().isoformat(),
+        "payment_id":      None,
+        "settled_at":      None,
+    }
+    log_audit_event(cid, "RECOVERY_STATE_INITIALIZED", {
+        "status":      initial_status,
+        "short_url":   payment_url,
+        "payment_link_id": payment_link_result.get("payment_link_id"),
+    })
 
     step("PAYMENT_LINK", {
         "payment_url": payment_url,
@@ -925,6 +951,23 @@ def diagnose_and_act(req: DiagnoseAndActRequest):
         "method":       dunning_result.get("method"),
         "message_preview": dunning_result.get("message_body", "")[:80] + "...",
     })
+
+    # ── 6b. Twilio SMS Dispatch ─────────────────────────────────
+    sms_result: Dict[str, Any] = {}
+    target_phone = req.customer_phone or _os.getenv("DEFAULT_CUSTOMER_PHONE", "+919234633668")
+    if payment_url and g_eval.status != "BLOCKED":
+        try:
+            sms_result = send_recovery_link_sms(
+                to_phone    = target_phone,
+                case_id     = req.case_id,
+                amount_inr  = req.amount_inr,
+                payment_url = payment_url,
+                custom_text = dunning_result.get("message_body"),
+            )
+            step("SMS_DISPATCHED", sms_result)
+            log_audit_event(req.case_id, "SMS_RECOVERY_DISPATCHED", sms_result)
+        except Exception as _sms_e:
+            step("SMS_DISPATCH_ERROR", {"error": str(_sms_e)})
 
     # ── 7. Audit + Cost Accounting ──────────────────────────────
     elapsed_ms = int((_dt.datetime.utcnow() - t0).total_seconds() * 1000)
@@ -980,11 +1023,142 @@ def diagnose_and_act(req: DiagnoseAndActRequest):
         },
 
         # Outreach
-        "outreach": dunning_result,
+        "outreach": {
+            **dunning_result,
+            "sms_dispatch":   sms_result,
+            "customer_phone": target_phone,
+        },
 
         # Audit trail
         "audit_steps":  audit_steps,
         "elapsed_ms":   elapsed_ms,
+
+        # Live proof loop ledger
+        "ledger_status":   initial_status,
+        "payment_link_id": payment_link_result.get("payment_link_id"),
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# Live Recovery Proof Loop & Razorpay Webhooks
+# ─────────────────────────────────────────────────────────────
+
+class TestSMSRequest(BaseModel):
+    phone: str = "+919234633668"
+    message: Optional[str] = None
+
+
+@app.post("/api/sms/send-test")
+def test_send_sms(req: TestSMSRequest):
+    """Dispatches a test SMS via Twilio to verify credentials and connectivity."""
+    body = req.message or f"RecoverAI Test: Twilio SMS service is operational for {req.phone}!"
+    result = send_recovery_sms(to_phone=req.phone, message_body=body)
+    return result
+
+
+@app.get("/api/cases/live/{case_id}")
+def get_live_case_status(case_id: str):
+    """
+    Returns the real-time mutation state of a recovery case from the ledger.
+    Used by the frontend to poll and detect when settlement occurs.
+    """
+    cid = str(case_id)
+    if cid in CASE_LEDGER:
+        return CASE_LEDGER[cid]
+    return {
+        "case_id":         cid,
+        "status":          "UNKNOWN",
+        "amount_inr":      0.0,
+        "payment_link_id": None,
+        "short_url":       None,
+        "updated_at":      datetime.datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/api/webhooks/razorpay")
+async def razorpay_webhook(payload: Dict[str, Any]):
+    """
+    Processes Razorpay payment link settlement webhooks (payment_link.paid / payment.captured)
+    or simulated webhook events from the demo console.
+    Mutates CASE_LEDGER status from PENDING_PAYMENT -> RECOVERED and logs the audit event.
+    """
+    event = payload.get("event", "payment_link.paid")
+    case_id = payload.get("case_id")
+    payment_id = payload.get("payment_id") or f"pay_settled_{uuid.uuid4().hex[:8]}"
+
+    # 1. Parse standard Razorpay webhook structure if present
+    entity = {}
+    if "payload" in payload and isinstance(payload["payload"], dict):
+        pl_entity = payload["payload"].get("payment_link", {}).get("entity", {})
+        pay_entity = payload["payload"].get("payment", {}).get("entity", {})
+        entity = pl_entity or pay_entity
+        notes = entity.get("notes", {})
+        if not case_id and notes:
+            case_id = notes.get("case_id")
+        if not payment_id and pay_entity.get("id"):
+            payment_id = pay_entity.get("id")
+
+    # 2. If case_id not directly extracted, match against payment_link_id
+    pl_id = entity.get("id") or payload.get("payment_link_id")
+    if not case_id and pl_id:
+        for cid, record in CASE_LEDGER.items():
+            if record.get("payment_link_id") == pl_id:
+                case_id = cid
+                break
+
+    # 3. Fallback: If only 1 pending case is in the ledger, map to it
+    if not case_id:
+        pending = [cid for cid, r in CASE_LEDGER.items() if r.get("status") == "PENDING_PAYMENT"]
+        if len(pending) == 1:
+            case_id = pending[0]
+
+    if not case_id:
+        return {
+            "status": "ignored",
+            "reason": "No matching active case_id found in ledger",
+            "event": event,
+        }
+
+    cid = str(case_id)
+    now_iso = datetime.datetime.utcnow().isoformat()
+    amount_recovered = 0.0
+
+    if cid in CASE_LEDGER:
+        amount_recovered = float(CASE_LEDGER[cid].get("amount_inr", 0.0))
+        CASE_LEDGER[cid]["status"] = "RECOVERED"
+        CASE_LEDGER[cid]["payment_id"] = payment_id
+        CASE_LEDGER[cid]["settled_at"] = now_iso
+        CASE_LEDGER[cid]["updated_at"] = now_iso
+    else:
+        amount_recovered = float(payload.get("amount_inr", 0.0))
+        CASE_LEDGER[cid] = {
+            "case_id":         cid,
+            "status":          "RECOVERED",
+            "amount_inr":      amount_recovered,
+            "payment_link_id": pl_id,
+            "short_url":       payload.get("short_url"),
+            "payment_id":      payment_id,
+            "settled_at":      now_iso,
+            "updated_at":      now_iso,
+        }
+
+    # Log settlement to central immutable audit trail
+    log_audit_event(cid, "PAYMENT_SETTLED_VIA_WEBHOOK", {
+        "event":            event,
+        "payment_id":       payment_id,
+        "amount_recovered": amount_recovered,
+        "settled_at":       now_iso,
+        "ledger_status":    "RECOVERED",
+    })
+
+    return {
+        "status":           "success",
+        "event":            event,
+        "case_id":          cid,
+        "state":            "RECOVERED",
+        "payment_id":       payment_id,
+        "amount_recovered": amount_recovered,
+        "settled_at":       now_iso,
     }
 
 
